@@ -1,8 +1,19 @@
 import 'server-only'
+import * as governor from './governor'
 
 const API_URL = 'https://api.z.ai/api/paas/v4/chat/completions'
 
 export type Msg = { role: 'system' | 'user' | 'assistant'; content: string }
+
+/** Upstream error carrying the server-suggested Retry-After (seconds), if any. */
+export class UpstreamError extends Error {
+  retryAfterSec?: number
+  constructor(message: string, retryAfterSec?: number) {
+    super(message)
+    this.name = 'UpstreamError'
+    this.retryAfterSec = retryAfterSec
+  }
+}
 
 /**
  * Free-tier friendly serial queue (GLM Flash models allow ~1 concurrent
@@ -37,8 +48,8 @@ export class QueueFullError extends Error {
 const TRANSIENT_ERROR = /\b429\b|overload|temporarily|rate limit/i
 
 /**
- * Retry transient free-tier failures (429 / overload) with short backoff.
- * Keeps the total added delay bounded so serverless functions stay under maxDuration.
+ * Retry transient free-tier failures (429 / overload) with short backoff,
+ * reporting every outcome to the rate governor (feeds the circuit breaker).
  */
 async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
   const waits = [0, 4_000, 9_000]
@@ -46,10 +57,17 @@ async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
   for (const w of waits) {
     if (w > 0) await new Promise((r) => setTimeout(r, w))
     try {
-      return await fn()
+      const out = await fn()
+      governor.noteUpstreamResult(true)
+      return out
     } catch (e) {
       lastErr = e
       const msg = e instanceof Error ? e.message : String(e)
+      if (TRANSIENT_ERROR.test(msg)) {
+        const ra = e instanceof UpstreamError && e.retryAfterSec ? e.retryAfterSec : undefined
+        governor.noteUpstreamResult(false, ra)
+        if (ra && ra >= 10) governor.penalize(ra)
+      }
       if (!TRANSIENT_ERROR.test(msg)) throw e
     }
   }
@@ -99,7 +117,9 @@ async function callWithEnvKey(messages: Msg[], jsonMode: boolean, keyOverride?: 
     } catch {
       msg += `: ${text.slice(0, 200)}`
     }
-    throw new Error(msg)
+    const raRaw = res.headers.get('retry-after')
+    const raSec = raRaw ? Number(raRaw) : undefined
+    throw new UpstreamError(msg, Number.isFinite(raSec) ? raSec : undefined)
   }
 
   const j = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
@@ -126,14 +146,22 @@ async function callSdk(messages: Msg[]): Promise<string> {
 
 /** userKey (optional) lets a visitor supply their own Z.ai key per-request. */
 export async function chat(messages: Msg[], userKey?: string): Promise<string> {
-  if (userKey) return withTransientRetry(() => callWithEnvKey(messages, true, userKey))
-  if (process.env.ZAI_API_KEY) return withTransientRetry(() => callWithEnvKey(messages, true))
+  await governor.acquire() // deterministic pacing — throws BusyError when the budget/breaker says wait
   try {
-    return await callSdk(messages)
+    if (userKey) return await withTransientRetry(() => callWithEnvKey(messages, true, userKey))
+    if (process.env.ZAI_API_KEY) return await withTransientRetry(() => callWithEnvKey(messages, true))
+    try {
+      return await callSdk(messages)
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e)
+      throw new Error(
+        `No model backend available. Add a ZAI_API_KEY environment variable (free key from the Z.ai API platform). [${detail}]`,
+      )
+    }
   } catch (e) {
-    const detail = e instanceof Error ? e.message : String(e)
-    throw new Error(
-      `No model backend available. Add a ZAI_API_KEY environment variable (free key from the Z.ai API platform). [${detail}]`,
-    )
+    if (e instanceof governor.BusyError) throw e
+    throw e
   }
 }
+
+export { governor }

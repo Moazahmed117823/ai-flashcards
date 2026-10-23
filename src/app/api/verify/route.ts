@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { buildVerifyMessages } from '@/lib/prompt'
-import { chat, enqueue, extractJson, QueueFullError } from '@/lib/server/llm'
+import { chat, enqueue, extractJson, QueueFullError, UpstreamError } from '@/lib/server/llm'
+import { BusyError } from '@/lib/server/governor'
 
 export const maxDuration = 60
 
@@ -60,6 +61,12 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     if (e instanceof QueueFullError) {
       return NextResponse.json({ error: e.message, retryAfter: 30 }, { status: 429 })
+    }
+    if (e instanceof BusyError) {
+      return NextResponse.json({ error: e.message, retryAfter: e.retryAfterSec, busy: true }, { status: 429 })
+    }
+    if (e instanceof UpstreamError && e.retryAfterSec) {
+      return NextResponse.json({ error: e.message, retryAfter: e.retryAfterSec, busy: true }, { status: 429 })
     }
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Verification failed.' }, { status: 502 })
   }

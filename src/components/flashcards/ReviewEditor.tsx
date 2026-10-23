@@ -1,7 +1,7 @@
 'use client'
 
-import { useState } from 'react'
-import { ArrowLeft, CircleAlert, CircleCheck, CircleMinus, Plus, Save, Trash2 } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { ArrowLeft, ChevronDown, CircleAlert, CircleCheck, CircleMinus, Plus, Save, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import type { Deck, Draft } from '@/lib/types'
 import { newCard, uid } from '@/lib/types'
@@ -18,6 +18,7 @@ interface Row {
   answer: string
   verdict?: 'ok' | 'fixed' | 'removed'
   note?: string
+  section?: string
 }
 
 interface Props {
@@ -33,8 +34,22 @@ export function ReviewEditor({ draft, onSave, onCancel }: Props) {
   const [topic, setTopic] = useState(draft.meta.topic)
   const [tagsStr, setTagsStr] = useState(draft.meta.tags.join(', '))
   const [rows, setRows] = useState<Row[]>(() =>
-    draft.cards.map((c) => ({ id: uid(), question: c.question, answer: c.answer, verdict: c.verdict, note: c.note })),
+    draft.cards.map((c) => ({ id: uid(), question: c.question, answer: c.answer, verdict: c.verdict, note: c.note, section: c.section })),
   )
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+
+  const orderedSections = useMemo(() => {
+    const names: string[] = []
+    for (const s of draft.sections ?? []) if (!names.includes(s)) names.push(s)
+    for (const r of rows) if (r.section && !names.includes(r.section)) names.push(r.section)
+    return names.length > 0 ? names : ['Cards']
+  }, [draft.sections, rows])
+
+  const emptySections = useMemo(
+    () => (draft.sections ?? []).filter((s) => !rows.some((r) => r.section === s)),
+    [draft.sections, rows],
+  )
+  const duplicatesMerged = draft.stats?.duplicatesMerged ?? 0
 
   const update = (id: string, patch: Partial<Row>) =>
     setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)))
@@ -127,64 +142,104 @@ export function ReviewEditor({ draft, onSave, onCancel }: Props) {
         </CardContent>
       </Card>
 
-      {/* Cards */}
-      <div className="space-y-3">
-        {rows.map((r, i) => (
-          <Card key={r.id} className={r.verdict === 'removed' ? 'border-red-600/40' : undefined}>
-            <CardContent className="space-y-3 p-4">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-muted-foreground">#{i + 1}</span>
-                  {r.verdict === 'ok' && (
-                    <Badge variant="outline" className="gap-1 border-emerald-600/40 text-emerald-600">
-                      <CircleCheck className="h-3 w-3" /> verified
-                    </Badge>
-                  )}
-                  {r.verdict === 'fixed' && (
-                    <Badge variant="outline" className="gap-1 border-amber-600/40 text-amber-600">
-                      <CircleAlert className="h-3 w-3" /> corrected
-                    </Badge>
-                  )}
-                  {r.verdict === 'removed' && (
-                    <Badge variant="outline" className="gap-1 border-red-600/40 text-red-600">
-                      <CircleMinus className="h-3 w-3" /> unsupported
-                    </Badge>
-                  )}
-                </div>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="text-destructive hover:text-destructive"
-                  onClick={() => setRows((rs) => rs.filter((x) => x.id !== r.id))}
-                  aria-label={`Delete card ${i + 1}`}
+      {(duplicatesMerged > 0 || emptySections.length > 0) && (
+        <div className="flex flex-col gap-1 rounded-lg border border-sky-600/30 bg-sky-600/5 p-3 text-sm text-sky-700 dark:text-sky-400">
+          {duplicatesMerged > 0 && (
+            <span>
+              {duplicatesMerged} duplicate card{duplicatesMerged > 1 ? 's' : ''} automatically merged during linking.
+            </span>
+          )}
+          {emptySections.length > 0 && (
+            <span>
+              No cards were produced for: {emptySections.join(', ')} — that part may be scanned/empty, or worth generating
+              separately.
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Cards — grouped by section */}
+      <div className="space-y-5">
+        {orderedSections.map((section) => {
+          const sectionRows = rows.filter((r) => (r.section ?? 'Cards') === section || (orderedSections.length === 1 && !r.section))
+          if (sectionRows.length === 0) return null
+          const isCollapsed = collapsed[section] === true
+          return (
+            <div key={section} className="space-y-3">
+              {orderedSections.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setCollapsed((c) => ({ ...c, [section]: !c[section] }))}
+                  className="flex w-full items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-left text-sm font-medium hover:bg-muted"
                 >
-                  <Trash2 className="h-4 w-4" />
-                </Button>
-              </div>
-              {r.note && r.verdict !== 'ok' && (
-                <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">{r.note}</p>
+                  <ChevronDown className={`h-4 w-4 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
+                  {section}
+                  <span className="ml-auto text-xs text-muted-foreground">{sectionRows.length} cards</span>
+                </button>
               )}
-              <div className="grid gap-3 md:grid-cols-2">
-                <div className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">Question</Label>
-                  <Textarea
-                    value={r.question}
-                    onChange={(e) => update(r.id, { question: e.target.value })}
-                    className="min-h-20 resize-y text-sm"
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">Answer</Label>
-                  <Textarea
-                    value={r.answer}
-                    onChange={(e) => update(r.id, { answer: e.target.value })}
-                    className="min-h-20 resize-y text-sm"
-                  />
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
+              {!isCollapsed &&
+                sectionRows.map((r) => {
+                  const i = rows.indexOf(r)
+                  return (
+                    <Card key={r.id} className={r.verdict === 'removed' ? 'border-red-600/40' : undefined}>
+                      <CardContent className="space-y-3 p-4">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-medium text-muted-foreground">#{i + 1}</span>
+                            {r.verdict === 'ok' && (
+                              <Badge variant="outline" className="gap-1 border-emerald-600/40 text-emerald-600">
+                                <CircleCheck className="h-3 w-3" /> verified
+                              </Badge>
+                            )}
+                            {r.verdict === 'fixed' && (
+                              <Badge variant="outline" className="gap-1 border-amber-600/40 text-amber-600">
+                                <CircleAlert className="h-3 w-3" /> corrected
+                              </Badge>
+                            )}
+                            {r.verdict === 'removed' && (
+                              <Badge variant="outline" className="gap-1 border-red-600/40 text-red-600">
+                                <CircleMinus className="h-3 w-3" /> unsupported
+                              </Badge>
+                            )}
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="text-destructive hover:text-destructive"
+                            onClick={() => setRows((rs) => rs.filter((x) => x.id !== r.id))}
+                            aria-label={`Delete card ${i + 1}`}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                        {r.note && r.verdict !== 'ok' && (
+                          <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">{r.note}</p>
+                        )}
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div className="space-y-1.5">
+                            <Label className="text-xs text-muted-foreground">Question</Label>
+                            <Textarea
+                              value={r.question}
+                              onChange={(e) => update(r.id, { question: e.target.value })}
+                              className="min-h-20 resize-y text-sm"
+                            />
+                          </div>
+                          <div className="space-y-1.5">
+                            <Label className="text-xs text-muted-foreground">Answer</Label>
+                            <Textarea
+                              value={r.answer}
+                              onChange={(e) => update(r.id, { answer: e.target.value })}
+                              className="min-h-20 resize-y text-sm"
+                            />
+                          </div>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )
+                })}
+            </div>
+          )
+        })}
       </div>
 
       <div className="flex flex-col gap-3 sm:flex-row">

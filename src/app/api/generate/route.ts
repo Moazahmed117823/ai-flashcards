@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { buildGenMessages } from '@/lib/prompt'
-import { chat, enqueue, extractJson, QueueFullError } from '@/lib/server/llm'
+import { chat, enqueue, extractJson, QueueFullError, UpstreamError } from '@/lib/server/llm'
+import { BusyError } from '@/lib/server/governor'
 
 export const maxDuration = 60
 
@@ -9,6 +10,8 @@ interface Body {
   count?: number
   difficulty?: 'easy' | 'medium' | 'hard' | 'mixed'
   language?: string
+  sectionName?: string
+  avoidTopics?: string[]
 }
 
 export async function POST(req: NextRequest) {
@@ -34,7 +37,14 @@ export async function POST(req: NextRequest) {
 
   try {
     const result = await enqueue(async () => {
-      const messages = buildGenMessages({ source, count, difficulty, language })
+      const messages = buildGenMessages({
+        source,
+        count,
+        difficulty,
+        language,
+        sectionName: body.sectionName,
+        avoidTopics: body.avoidTopics,
+      })
 
       let raw = await chat(messages, userKey)
       let parsed: Record<string, unknown>
@@ -74,6 +84,12 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     if (e instanceof QueueFullError) {
       return NextResponse.json({ error: e.message, retryAfter: 30 }, { status: 429 })
+    }
+    if (e instanceof BusyError) {
+      return NextResponse.json({ error: e.message, retryAfter: e.retryAfterSec, busy: true }, { status: 429 })
+    }
+    if (e instanceof UpstreamError && e.retryAfterSec) {
+      return NextResponse.json({ error: e.message, retryAfter: e.retryAfterSec, busy: true }, { status: 429 })
     }
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Generation failed.' }, { status: 502 })
   }

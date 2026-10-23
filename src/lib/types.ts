@@ -48,12 +48,62 @@ export interface GeneratedCard {
   answer: string
   verdict?: 'ok' | 'fixed' | 'removed'
   note?: string
+  section?: string
 }
 
 export interface Draft {
   meta: DeckMeta
   cards: GeneratedCard[]
   sourceExcerpt: string
+  sections?: string[]
+  stats?: { duplicatesMerged: number }
+}
+
+/* ---------- long-file pipeline (chunked, checkpointed) ---------- */
+
+export interface PipelineChunk {
+  i: number
+  heading: string
+  text: string
+}
+
+export interface MapResult {
+  sections: Array<{ title: string; from: number; to: number }>
+  budget: Array<{ i: number; cards: number }>
+}
+
+export interface PipelineOptions {
+  count: number
+  difficulty: Difficulty
+  language: string
+  verify: boolean
+  deep: boolean
+  sourceName?: string
+}
+
+export interface PipelineCheckpoint {
+  id: string
+  createdAt: number
+  updatedAt: number
+  source: string
+  opts: PipelineOptions
+  chunks: PipelineChunk[]
+  doneCount: number
+  cards: GeneratedCard[]
+  coveredTopics: string[]
+  mapResult?: MapResult
+  firstMeta?: DeckMeta
+}
+
+export interface PipelineProgress {
+  stage: 'extract' | 'map' | 'generate' | 'link' | 'verify' | 'finalize'
+  label: string
+  pct: number
+  partsDone: number
+  partsTotal: number
+  cardsSoFar: number
+  etaSec?: number
+  retryInSec?: number
 }
 
 export const uid = (): string => {
