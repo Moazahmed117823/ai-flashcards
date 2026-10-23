@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { Database, Download, HardDriveDownload, KeyRound, ShieldAlert, Upload } from 'lucide-react'
 import { toast } from 'sonner'
 import type { Deck } from '@/lib/types'
-import { clearAllDecks, exportAll, importDecks, storageEstimate } from '@/lib/storage'
+import { clearAllDecks, downloadFile, exportAll, importDecks, storageEstimate } from '@/lib/storage'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import {

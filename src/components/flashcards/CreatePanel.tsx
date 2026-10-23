@@ -333,6 +333,19 @@ export function CreatePanel({ onDraft }: Props) {
               <CircleAlert className="h-3.5 w-3.5" /> Your progress is saved — generation resumes automatically.
             </p>
           )}
+          {progress.preview && progress.preview.length > 0 && (
+            <div className="rounded-xl border bg-muted/30 p-3">
+              <p className="mb-2 text-xs font-medium text-muted-foreground">Latest cards — each one already saved</p>
+              <div className="max-h-60 space-y-2 overflow-y-auto pr-1">
+                {[...progress.preview].reverse().map((c, k) => (
+                  <div key={`${k}-${c.question.slice(0, 24)}`} className="rounded-lg bg-background p-2.5">
+                    <p className="text-sm font-medium leading-snug">{c.question}</p>
+                    <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{c.answer}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

@@ -245,6 +245,26 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+/* ============================ micro-chunking ============================ */
+
+/** Below this size a part is no longer split — the request is already tiny. */
+const MICRO_FLOOR = 1_500
+
+/** Find a paragraph/sentence boundary near the middle of `text` for clean splits. */
+function splitPoint(text: string): number {
+  const raw = Math.floor(text.length / 2)
+  const lo = Math.max(1, Math.floor(text.length * 0.35))
+  const hi = Math.min(text.length - 1, Math.ceil(text.length * 0.65))
+  let cut = raw
+  const nl2 = text.lastIndexOf('\n\n', raw)
+  const nl1 = text.lastIndexOf('\n', raw)
+  const sent = text.lastIndexOf('. ', raw)
+  if (nl2 >= lo) cut = nl2
+  else if (nl1 >= lo) cut = nl1
+  else if (sent >= lo) cut = sent + 1
+  return Math.min(hi, Math.max(lo, cut))
+}
+
 /* ============================ the runner ============================ */
 
 export interface RunHandle {
@@ -286,25 +306,41 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
 
   const chunks = cp.chunks
   const total = chunks.length
-  const chunkDurationsSec: number[] = []
+  const totalChars = Math.max(1, chunks.reduce((a, c) => a + c.text.length, 0))
+
+  // Remaining work queue. A previous run may have saved a fine-grained queue
+  // (containing split sub-chunks); otherwise derive it from the original chunks.
+  const work: PipelineChunk[] =
+    cp.queue && cp.queue.length > 0 ? cp.queue : chunks.slice(Math.min(cp.doneCount, total))
+  let pos = 0
+
+  const remainingChars = (): number => {
+    let s = 0
+    for (let k = pos; k < work.length; k++) s += work[k].text.length
+    return s
+  }
+  const partsDone = (): number => total - new Set(work.slice(pos).map((c) => c.i)).size
+  const charRates: number[] = [] // chars/sec per finished item — honest ETA across granularities
 
   const emit = (p: Partial<PipelineProgress> & { stage: PipelineProgress['stage']; label: string }) => {
     const cardsSoFar = cp.cards.length
-    const remaining = Math.max(0, total - cp.doneCount)
-    const avg = chunkDurationsSec.length ? chunkDurationsSec.reduce((a, b) => a + b, 0) / chunkDurationsSec.length : 22
+    const done = Math.max(0, partsDone())
+    const queuePct = Math.min(92, Math.round(((totalChars - remainingChars()) / totalChars) * 92))
+    const avgRate = charRates.length ? charRates.reduce((a, b) => a + b, 0) / charRates.length : 350
     const etaSec =
       p.retryInSec !== undefined
         ? p.retryInSec
-        : Math.round(remaining * avg * (opts.verify ? 1.7 : 1) * (opts.deep ? 1.15 : 1))
+        : Math.round((remainingChars() / Math.max(80, avgRate)) * (opts.verify ? 1.7 : 1) * (opts.deep ? 1.15 : 1))
     hooks.onProgress({
       stage: p.stage,
       label: p.label,
-      pct: p.pct ?? Math.min(98, Math.round((cp.doneCount / Math.max(1, total)) * 88)),
-      partsDone: p.partsDone ?? cp.doneCount,
+      pct: p.pct ?? queuePct,
+      partsDone: p.partsDone ?? done,
       partsTotal: p.partsTotal ?? total,
       cardsSoFar,
       etaSec,
       retryInSec: p.retryInSec,
+      preview: p.preview,
     })
   }
 
@@ -324,24 +360,63 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
     return chunks[i]?.heading ?? `Part ${i + 1}`
   }
 
-  const callGenerate = async (chunk: PipelineChunk): Promise<{ cards: GeneratedCard[]; meta?: DeckMeta }> => {
+  const budgetForItem = (item: PipelineChunk): number => {
+    const full = budgetFor(item.i)
+    const orig = chunks[item.i]
+    if (!orig || orig.text.length === 0 || item.text.length >= orig.text.length) return full
+    // Split sub-chunk: inherit a proportional share of the parent's budget so
+    // the final card total stays close to what the user asked for.
+    return Math.max(1, Math.round((item.text.length / orig.text.length) * full))
+  }
+
+  /**
+   * One generation attempt loop for queue[at]. On a busy signal the part is
+   * split in half (micro-checkpoint) and the smaller half retried — shorter
+   * requests slip into capacity gaps and every success is saved immediately.
+   * Only the failing part shrinks; untouched parts keep their cheaper size.
+   */
+  const callGenerate = async (
+    queue: PipelineChunk[],
+    at: number,
+  ): Promise<{ cards: GeneratedCard[]; meta?: DeckMeta; item: PipelineChunk }> => {
+    let item = queue[at]
     for (;;) {
-      if (handle.aborted) return { cards: [] }
+      if (handle.aborted) return { cards: [], item }
       try {
         const data = await postJSON<{ meta?: DeckMeta; cards?: GeneratedCard[] }>('/api/generate', {
-          source: chunk.text,
-          count: budgetFor(chunk.i),
+          source: item.text,
+          count: budgetForItem(item),
           difficulty: opts.difficulty,
           language: opts.language,
-          sectionName: sectionFor(chunk.i),
+          sectionName: sectionFor(item.i),
           avoidTopics: cp.coveredTopics.slice(-24),
         })
-        return { cards: data.cards ?? [], meta: data.meta }
+        return { cards: data.cards ?? [], meta: data.meta, item }
       } catch (e) {
         const err = e as Error & { retryAfter?: number; busy?: boolean }
-        if (handle.aborted) return { cards: [] }
+        if (handle.aborted) return { cards: [], item }
         if (err.busy) {
           const wait = Math.min(Math.max(err.retryAfter ?? 20, 8), 60)
+          if (item.text.length > MICRO_FLOOR * 2) {
+            const mid = splitPoint(item.text)
+            const a: PipelineChunk = { i: item.i, heading: item.heading, text: item.text.slice(0, mid).trim() }
+            const b: PipelineChunk = {
+              i: item.i,
+              heading: item.heading.includes('(cont.') ? item.heading : `${item.heading} (cont.)`,
+              text: item.text.slice(mid).trim(),
+            }
+            queue[at] = a
+            queue.splice(at + 1, 0, b)
+            item = a
+            const pause = Math.min(wait, 15)
+            emit({
+              stage: 'generate',
+              label: 'Free tier is busy — splitting this part in half for better odds…',
+              retryInSec: pause,
+            })
+            await sleep(pause * 1000)
+            continue
+          }
           emit({ stage: 'generate', label: `Free tier busy — auto-resuming in ${wait}s…`, retryInSec: wait })
           await sleep(wait * 1000)
           continue
@@ -380,6 +455,41 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
 
   emit({ stage: 'extract', label: 'Preparing sections…', pct: 3 })
 
+  // Pre-flight capacity probe — start smart instead of firing the first request
+  // into a saturated pool. /api/status reads the governor's memory (no model
+  // call, no tokens). Bounded: after a few tries we start anyway and let the
+  // server governor pace us.
+  const preflight = async (): Promise<void> => {
+    for (let k = 0; k < 4; k++) {
+      if (handle.aborted) return
+      try {
+        const res = await fetch('/api/status', { cache: 'no-store' })
+        if (!res.ok) return
+        const s = (await res.json()) as {
+          queuePending?: number
+          governor?: { windowMax: number; windowUsed: number; breakerRemainingSec: number }
+        }
+        const g = s.governor
+        if (!g) return
+        if (g.breakerRemainingSec > 0) {
+          const w = Math.min(g.breakerRemainingSec + 2, 60)
+          emit({ stage: 'extract', label: `Model capacity cooling down — starting in ~${w}s…`, retryInSec: w, pct: 3 })
+          await sleep(w * 1000)
+          continue
+        }
+        if ((s.queuePending ?? 0) > 0 || g.windowUsed >= g.windowMax) {
+          emit({ stage: 'extract', label: 'Waiting for a free generation slot…', retryInSec: 10, pct: 3 })
+          await sleep(10_000)
+          continue
+        }
+        return
+      } catch {
+        return // probe failed — proceed; the server governor paces us anyway
+      }
+    }
+  }
+  await preflight()
+
   // ---- deep map (optional, once) ----
   if (opts.deep && !cp.mapResult && total >= 2) {
     for (;;) {
@@ -409,14 +519,15 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
     }
   }
 
-  // ---- generation loop (each chunk = a checkpoint) ----
-  for (let i = cp.doneCount; i < total; i++) {
+  // ---- generation loop (every part, however small, is a checkpoint) ----
+  while (pos < work.length) {
     if (handle.aborted) break
-    const chunk = chunks[i]
+    const planned = work[pos]
+    const partNo = Math.min(partsDone() + 1, total)
+    emit({ stage: 'generate', label: `Part ${partNo}/${total} — ${planned.heading} · generating…` })
     const t0 = Date.now()
-    emit({ stage: 'generate', label: `Part ${i + 1}/${total} — ${chunk.heading} · generating…` })
 
-    const { cards: genCards, meta } = await callGenerate(chunk)
+    const { cards: genCards, meta, item } = await callGenerate(work, pos)
     if (handle.aborted) break
     if (meta && !cp.firstMeta) {
       cp.firstMeta = meta
@@ -425,11 +536,11 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
       }
     }
 
-    let chunkCards: GeneratedCard[] = genCards.map((c) => ({ ...c, section: sectionFor(i) }))
+    let chunkCards: GeneratedCard[] = genCards.map((c) => ({ ...c, section: sectionFor(item.i) }))
 
     if (opts.verify && chunkCards.length > 0) {
-      emit({ stage: 'verify', label: `Part ${i + 1}/${total} — precision check…` })
-      chunkCards = await callVerify(chunk, chunkCards)
+      emit({ stage: 'verify', label: `Part ${partNo}/${total} — precision check…` })
+      chunkCards = await callVerify(item, chunkCards)
     }
 
     cp.cards.push(...chunkCards)
@@ -437,10 +548,17 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
       const topic = c.question.split(/\s+/).slice(0, 9).join(' ')
       if (topic && !cp.coveredTopics.includes(topic)) cp.coveredTopics.push(topic)
     }
-    cp.doneCount = i + 1
-    chunkDurationsSec.push((Date.now() - t0) / 1000)
+
+    pos++
+    charRates.push(Math.max(30, item.text.length / Math.max(1, (Date.now() - t0) / 1000)))
+    cp.doneCount = Math.max(0, partsDone())
+    cp.queue = work.slice(pos)
     saveCheckpoint(cp)
-    emit({ stage: 'generate', label: `Part ${i + 1}/${total} done — ${cp.cards.length} cards so far` })
+    emit({
+      stage: 'generate',
+      label: `Part ${Math.min(partsDone(), total)}/${total} done — ${cp.cards.length} cards so far`,
+      preview: cp.cards.slice(-5).map((c) => ({ question: c.question, answer: c.answer })),
+    })
   }
 
   if (handle.aborted) {

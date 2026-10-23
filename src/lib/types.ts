@@ -93,6 +93,13 @@ export interface PipelineCheckpoint {
   coveredTopics: string[]
   mapResult?: MapResult
   firstMeta?: DeckMeta
+  /** Remaining fine-grained work (may contain split sub-chunks); overrides doneCount when present. */
+  queue?: PipelineChunk[]
+}
+
+export interface PreviewCard {
+  question: string
+  answer: string
 }
 
 export interface PipelineProgress {
@@ -104,6 +111,7 @@ export interface PipelineProgress {
   cardsSoFar: number
   etaSec?: number
   retryInSec?: number
+  preview?: PreviewCard[]
 }
 
 export const uid = (): string => {

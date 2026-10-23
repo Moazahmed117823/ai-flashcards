@@ -81,7 +81,7 @@ export async function importDecks(json: string): Promise<ImportResult> {
   let updated = 0
   for (const raw of decksRaw) {
     const deck = raw as Partial<Deck>
-    if (!deck || typeof deck !== 'object' || !Array.isArray(deck.cards) || typeof deck.title !== 'string') continue
+    if (!deck || typeof deck !== 'object' || !Array.isArray(deck.cards) || typeof deck.title !== 'string' || typeof deck.id !== 'string') continue
     const existing = (await d.get(STORE, deck.id)) as Deck | undefined
     if (existing && (existing.updatedAt ?? 0) >= (deck.updatedAt ?? 0)) continue
     await d.put(STORE, deck)
