@@ -1,7 +1,15 @@
 import 'server-only'
 import * as governor from './governor'
 
-const API_URL = 'https://api.z.ai/api/paas/v4/chat/completions'
+const API_URL = process.env.ZAI_API_URL || 'https://api.z.ai/api/paas/v4/chat/completions'
+// Personal (BYOK) keys are Z.ai keys — they always go to Z.ai first-party,
+// even if the shared pool is pointed at another OpenAI-compatible provider
+// (e.g. OpenRouter via ZAI_API_URL). Pool keys use POOL_MODEL; personal keys
+// use USER_MODEL, so the two can coexist with different model slugs.
+const USER_API_URL = 'https://api.z.ai/api/paas/v4/chat/completions'
+const POOL_MODEL = process.env.ZAI_MODEL_POOL || process.env.ZAI_MODEL || 'glm-4.7-flash'
+const USER_MODEL = process.env.ZAI_MODEL || 'glm-4.7-flash'
+const POOL_KEYS = new Set<string>(governor.upstreamKeys())
 
 export type Msg = { role: 'system' | 'user' | 'assistant'; content: string }
 
@@ -132,15 +140,17 @@ export function extractJson(raw: string): Record<string, unknown> {
 }
 
 async function callWithEnvKey(messages: Msg[], jsonMode: boolean, keyOverride?: string): Promise<string> {
+  const isPool = !keyOverride || POOL_KEYS.has(keyOverride)
+  const url = isPool ? API_URL : USER_API_URL
+  const model = isPool ? POOL_MODEL : USER_MODEL
   const key = keyOverride || (process.env.ZAI_API_KEY as string)
-  const model = (process.env.ZAI_MODEL as string) || 'glm-4.7-flash'
   const thinking = (process.env.ZAI_THINKING as string) || 'disabled'
 
   const body: Record<string, unknown> = { model, messages, temperature: 0.3 }
   if (thinking === 'enabled') body.thinking = { type: 'enabled' }
   if (jsonMode) body.response_format = { type: 'json_object' }
 
-  const res = await fetch(API_URL, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
     body: JSON.stringify(body),
