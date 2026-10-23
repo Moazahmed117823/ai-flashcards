@@ -10,6 +10,10 @@ const USER_API_URL = 'https://api.z.ai/api/paas/v4/chat/completions'
 const POOL_MODEL = process.env.ZAI_MODEL_POOL || process.env.ZAI_MODEL || 'glm-4.7-flash'
 const USER_MODEL = process.env.ZAI_MODEL || 'glm-4.7-flash'
 const POOL_KEYS = new Set<string>(governor.upstreamKeys())
+// Optional: pin the OpenRouter routing to a specific provider (e.g. an fp8
+// quantization lane) so cheap fp4 endpoints never silently serve requests.
+// Example: ZAI_PROVIDER_PIN=Novita  ->  provider.order=["Novita"], no fallback.
+const PROVIDER_PIN = process.env.ZAI_PROVIDER_PIN?.trim()
 
 export type Msg = { role: 'system' | 'user' | 'assistant'; content: string }
 
@@ -149,6 +153,9 @@ async function callWithEnvKey(messages: Msg[], jsonMode: boolean, keyOverride?: 
   const body: Record<string, unknown> = { model, messages, temperature: 0.3 }
   if (thinking === 'enabled') body.thinking = { type: 'enabled' }
   if (jsonMode) body.response_format = { type: 'json_object' }
+  if (PROVIDER_PIN && /openrouter\.ai/.test(url)) {
+    body.provider = { order: [PROVIDER_PIN], allow_fallbacks: false }
+  }
 
   const res = await fetch(url, {
     method: 'POST',
