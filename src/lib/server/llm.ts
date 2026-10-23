@@ -152,7 +152,7 @@ async function callWithEnvKey(messages: Msg[], jsonMode: boolean, keyOverride?: 
     // This key's account just got rejected — cool it down so the next attempt
     // (or the next request) picks a different key from the pool.
     governor.penalizeKey(keyOverride, res.status === 429 || res.status >= 500 ? 20 : 5)
-    if (res.status === 400 && jsonMode) return callWithEnvKey(messages, false) // endpoint may not support response_format
+    if (res.status === 400 && jsonMode) return callWithEnvKey(messages, false, keyOverride) // endpoint may not support response_format
     let msg = `Model API error ${res.status}`
     try {
       const j = JSON.parse(text) as { error?: { message?: string } }
@@ -198,11 +198,30 @@ export async function chat(messages: Msg[], userKey?: string): Promise<string> {
     if (budgetMs < 15_000) {
       throw new governor.BusyError(12, 'Queue wait used this request window — starting fresh in a few seconds.')
     }
-    if (userKey) return await withTransientRetry(() => callWithEnvKey(messages, true, userKey), budgetMs)
+    if (userKey) {
+      // Personal lane: the visitor's own key gets first pick. One attempt — if
+      // their account is momentarily saturated (concurrency 1 / quota), do NOT
+      // burn the request stalling on the same key: spill to the shared pool so
+      // the run keeps moving on other lanes. Non-transient errors (401/403
+      // bad key, 400 bad request) propagate untouched so /api/validate and the
+      // UI can tell the user their key is the problem.
+      try {
+        return await callWithEnvKey(messages, true, userKey)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        const remaining = 54_000 - (Date.now() - entered)
+        // Spill only when a full pool attempt (up to ~40s) still fits the 60s
+        // function cap; otherwise rethrow — the route maps transient errors to
+        // 429 {busy} and the client's checkpointed pause/resume takes over.
+        if (!isTransientMessage(msg) || remaining < 40_000 || !process.env.ZAI_API_KEY) throw e
+        // fall through to the shared pool below
+      }
+    }
     if (process.env.ZAI_API_KEY) {
       // Each attempt picks the healthiest pooled key — a key that just got a
       // 429 is skipped in favor of the next one, inside the same request.
-      return await withTransientRetry(() => callWithEnvKey(messages, true, governor.pickKey()), budgetMs)
+      const freshBudget = Math.min(budgetMs, 54_000 - (Date.now() - entered))
+      return await withTransientRetry(() => callWithEnvKey(messages, true, governor.pickKey()), freshBudget)
     }
     try {
       return await callSdk(messages)
