@@ -235,15 +235,25 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
   const data = (await res.json().catch(() => ({}))) as T & { error?: string; retryAfter?: number; busy?: boolean }
   if (!res.ok) {
-    const err = new Error(data.error || `Request failed (${res.status})`) as Error & { retryAfter?: number; busy?: boolean }
+    const err = new Error(data.error || `Request failed (${res.status})`) as Error & {
+      retryAfter?: number
+      busy?: boolean
+      status?: number
+    }
     err.retryAfter = data.retryAfter
     err.busy = data.busy === true || res.status === 429
+    err.status = res.status
     throw err
   }
   return data
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** Matches the server's notion of transient free-tier saturation. */
+const TRANSIENT_RE = /\b429\b|overload|temporarily|rate limit/i
+/** Cap for unflagged busy retries (gateway 502/504 etc.) so a dead upstream ends the run with a clear message. */
+const SOFT_BUSY_CAP = 8
 
 /* ============================ micro-chunking ============================ */
 
@@ -380,6 +390,7 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
     at: number,
   ): Promise<{ cards: GeneratedCard[]; meta?: DeckMeta; item: PipelineChunk }> => {
     let item = queue[at]
+    let softRetries = 0
     for (;;) {
       if (handle.aborted) return { cards: [], item }
       try {
@@ -393,9 +404,18 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
         })
         return { cards: data.cards ?? [], meta: data.meta, item }
       } catch (e) {
-        const err = e as Error & { retryAfter?: number; busy?: boolean }
+        const err = e as Error & { retryAfter?: number; busy?: boolean; status?: number }
         if (handle.aborted) return { cards: [], item }
-        if (err.busy) {
+        // Defense in depth: gateway timeouts (504) and Retry-After-less 429s
+        // arrive without the busy flag — recognize them by shape and pause
+        // instead of aborting the whole run.
+        const softBusy = !err.busy && (TRANSIENT_RE.test(err.message) || err.status === 502 || err.status === 504)
+        if (err.busy || softBusy) {
+          if (softBusy && ++softRetries > SOFT_BUSY_CAP) {
+            throw new Error(
+              'The free model tier stayed busy for several minutes. Your progress is saved — wait a moment, then press Generate to resume.',
+            )
+          }
           const wait = Math.min(Math.max(err.retryAfter ?? 20, 8), 60)
           if (item.text.length > MICRO_FLOOR * 2) {
             const mid = splitPoint(item.text)
@@ -445,8 +465,8 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
         }
         return cards
       } catch (e) {
-        const err = e as Error & { retryAfter?: number; busy?: boolean }
-        if (err.busy) continue
+        const err = e as Error & { retryAfter?: number; busy?: boolean; status?: number }
+        if (err.busy || TRANSIENT_RE.test(err.message) || err.status === 502 || err.status === 504) continue
         return cards // verification is best-effort per chunk
       }
     }

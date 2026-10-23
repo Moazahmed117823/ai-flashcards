@@ -47,19 +47,22 @@ export class QueueFullError extends Error {
 
 const TRANSIENT_ERROR = /\b429\b|overload|temporarily|rate limit/i
 
+/** True when an error message looks like free-tier saturation (429/overload). */
+export const isTransientMessage = (msg: string): boolean => TRANSIENT_ERROR.test(msg)
+
 /**
  * Retry transient free-tier failures (429 / overload) with short backoff,
  * reporting every outcome to the rate governor (feeds the circuit breaker).
+ * `budgetMs` caps total time so the 60s serverless function never times out.
  */
-async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
+async function withTransientRetry<T>(fn: () => Promise<T>, budgetMs = 54_000): Promise<T> {
   const waits = [0, 4_000, 9_000]
   const start = Date.now()
-  const TOTAL_BUDGET_MS = 54_000 // stay under the 60s serverless cap
   let lastErr: unknown
   for (const w of waits) {
     if (w > 0) {
       // never start another attempt unless the remaining function budget allows it
-      if (Date.now() - start + w + 10_000 > TOTAL_BUDGET_MS) break
+      if (Date.now() - start + w + 12_000 > budgetMs) break
       await new Promise((r) => setTimeout(r, w))
     }
     try {
@@ -110,7 +113,7 @@ async function callWithEnvKey(messages: Msg[], jsonMode: boolean, keyOverride?: 
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(55_000),
+    signal: AbortSignal.timeout(40_000),
   })
 
   if (!res.ok) {
@@ -152,10 +155,17 @@ async function callSdk(messages: Msg[]): Promise<string> {
 
 /** userKey (optional) lets a visitor supply their own Z.ai key per-request. */
 export async function chat(messages: Msg[], userKey?: string): Promise<string> {
+  const entered = Date.now()
   await governor.acquire() // deterministic pacing — throws BusyError when the budget/breaker says wait
+  // The queue wait counts against this function's 60s Vercel cap. If it ate
+  // most of the window, refuse politely (busy) instead of risking a 504.
+  const budgetMs = 54_000 - (Date.now() - entered)
+  if (budgetMs < 15_000) {
+    throw new governor.BusyError(12, 'Queue wait used this request window — starting fresh in a few seconds.')
+  }
   try {
-    if (userKey) return await withTransientRetry(() => callWithEnvKey(messages, true, userKey))
-    if (process.env.ZAI_API_KEY) return await withTransientRetry(() => callWithEnvKey(messages, true))
+    if (userKey) return await withTransientRetry(() => callWithEnvKey(messages, true, userKey), budgetMs)
+    if (process.env.ZAI_API_KEY) return await withTransientRetry(() => callWithEnvKey(messages, true), budgetMs)
     try {
       return await callSdk(messages)
     } catch (e) {

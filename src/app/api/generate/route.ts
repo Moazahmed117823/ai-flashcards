@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { buildGenMessages } from '@/lib/prompt'
-import { chat, enqueue, extractJson, QueueFullError, UpstreamError } from '@/lib/server/llm'
+import { chat, enqueue, extractJson, isTransientMessage, QueueFullError, UpstreamError } from '@/lib/server/llm'
 import { BusyError } from '@/lib/server/governor'
 
 export const maxDuration = 60
@@ -90,6 +90,11 @@ export async function POST(req: NextRequest) {
     }
     if (e instanceof UpstreamError && e.retryAfterSec) {
       return NextResponse.json({ error: e.message, retryAfter: e.retryAfterSec, busy: true }, { status: 429 })
+    }
+    // Z.ai 429s often arrive WITHOUT a Retry-After header — they must still be
+    // treated as "busy" so the client pauses and resumes instead of aborting.
+    if (e instanceof Error && isTransientMessage(e.message)) {
+      return NextResponse.json({ error: e.message, retryAfter: 20, busy: true }, { status: 429 })
     }
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Generation failed.' }, { status: 502 })
   }

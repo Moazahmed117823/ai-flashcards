@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { buildVerifyMessages } from '@/lib/prompt'
-import { chat, enqueue, extractJson, QueueFullError, UpstreamError } from '@/lib/server/llm'
+import { chat, enqueue, extractJson, isTransientMessage, QueueFullError, UpstreamError } from '@/lib/server/llm'
 import { BusyError } from '@/lib/server/governor'
 
 export const maxDuration = 60
@@ -67,6 +67,10 @@ export async function POST(req: NextRequest) {
     }
     if (e instanceof UpstreamError && e.retryAfterSec) {
       return NextResponse.json({ error: e.message, retryAfter: e.retryAfterSec, busy: true }, { status: 429 })
+    }
+    // Retry-After-less upstream 429s must also surface as busy (see generate route).
+    if (e instanceof Error && isTransientMessage(e.message)) {
+      return NextResponse.json({ error: e.message, retryAfter: 20, busy: true }, { status: 429 })
     }
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Verification failed.' }, { status: 502 })
   }
