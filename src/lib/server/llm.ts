@@ -53,9 +53,15 @@ const TRANSIENT_ERROR = /\b429\b|overload|temporarily|rate limit/i
  */
 async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
   const waits = [0, 4_000, 9_000]
+  const start = Date.now()
+  const TOTAL_BUDGET_MS = 54_000 // stay under the 60s serverless cap
   let lastErr: unknown
   for (const w of waits) {
-    if (w > 0) await new Promise((r) => setTimeout(r, w))
+    if (w > 0) {
+      // never start another attempt unless the remaining function budget allows it
+      if (Date.now() - start + w + 10_000 > TOTAL_BUDGET_MS) break
+      await new Promise((r) => setTimeout(r, w))
+    }
     try {
       const out = await fn()
       governor.noteUpstreamResult(true)
