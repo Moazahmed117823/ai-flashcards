@@ -103,18 +103,68 @@ export function CreatePanel({ onDraft }: Props) {
       let finalCards = all
 
       if (verify && all.length > 0) {
-        setStage('Verification pass — checking every card against the source…')
-        setPct(85)
-        const vres = await fetch('/api/verify', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ source: chunks.join('\n\n').slice(0, 80_000), cards: all.map((c) => ({ question: c.question, answer: c.answer })) }),
-        })
-        const vdata = (await vres.json().catch(() => ({}))) as { error?: string; cards?: GeneratedCard[] }
-        if (vres.ok && Array.isArray(vdata.cards) && vdata.cards.length > 0) {
-          finalCards = vdata.cards
+        setStage('Precision check — verifying every card against the source…')
+        setPct(80)
+        const BATCH = 20
+        const batches: GeneratedCard[][] = []
+        for (let i = 0; i < all.length; i += BATCH) batches.push(all.slice(i, i + BATCH))
+
+        finalCards = []
+        let okN = 0
+        let fixedN = 0
+        let removedN = 0
+        let failed = false
+        let lastError = ''
+
+        for (let b = 0; b < batches.length; b++) {
+          if (batches.length > 1) {
+            setStage(`Precision check — batch ${b + 1}/${batches.length}…`)
+            setPct(80 + Math.round((b / batches.length) * 15))
+          }
+          let done = false
+          // up to 3 attempts per batch — the free tier intermittently 429s right after a generation call
+          for (const waitSec of [0, 8, 15]) {
+            if (waitSec > 0) {
+              setStage(`Free tier busy — retrying precision check in ${waitSec}s…`)
+              await new Promise((r) => setTimeout(r, waitSec * 1000))
+            }
+            try {
+              const vres = await fetch('/api/verify', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ source: chunks.join('\n\n').slice(0, 80_000), cards: batches[b] }),
+              })
+              const vdata = (await vres.json().catch(() => ({}))) as { error?: string; cards?: GeneratedCard[] }
+              if (vres.ok && Array.isArray(vdata.cards) && vdata.cards.length > 0) {
+                finalCards.push(...vdata.cards)
+                done = true
+                break
+              }
+              lastError = vdata.error ?? `HTTP ${vres.status}`
+            } catch {
+              lastError = 'network error'
+            }
+          }
+          if (!done) {
+            // keep the unverified cards rather than losing them, and stop trying further batches
+            failed = true
+            finalCards.push(...batches.slice(b).flat())
+            break
+          }
+        }
+
+        for (const c of finalCards) {
+          if (c.verdict === 'fixed') fixedN++
+          else if (c.verdict === 'removed') removedN++
+          else okN++
+        }
+        setPct(98)
+        if (failed) {
+          toast.warning(
+            `Precision check incomplete (${lastError}) — free tier is busy. Cards were kept unverified; review carefully or regenerate.`,
+          )
         } else {
-          toast.warning(`Verification pass skipped: ${vdata.error ?? 'unknown error'}`)
+          toast.success(`Precision check done — ${okN} verified · ${fixedN} corrected · ${removedN} unsupported`)
         }
       }
 

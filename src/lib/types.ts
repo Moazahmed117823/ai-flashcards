@@ -46,6 +46,8 @@ export interface GenOptions {
 export interface GeneratedCard {
   question: string
   answer: string
+  verdict?: 'ok' | 'fixed' | 'removed'
+  note?: string
 }
 
 export interface Draft {

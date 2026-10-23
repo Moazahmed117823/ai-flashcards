@@ -34,6 +34,28 @@ export class QueueFullError extends Error {
   }
 }
 
+const TRANSIENT_ERROR = /\b429\b|overload|temporarily|rate limit/i
+
+/**
+ * Retry transient free-tier failures (429 / overload) with short backoff.
+ * Keeps the total added delay bounded so serverless functions stay under maxDuration.
+ */
+async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const waits = [0, 4_000, 9_000]
+  let lastErr: unknown
+  for (const w of waits) {
+    if (w > 0) await new Promise((r) => setTimeout(r, w))
+    try {
+      return await fn()
+    } catch (e) {
+      lastErr = e
+      const msg = e instanceof Error ? e.message : String(e)
+      if (!TRANSIENT_ERROR.test(msg)) throw e
+    }
+  }
+  throw lastErr
+}
+
 /** Pull the first balanced JSON object out of arbitrary model output. */
 export function extractJson(raw: string): Record<string, unknown> {
   let t = raw.trim()
@@ -104,8 +126,8 @@ async function callSdk(messages: Msg[]): Promise<string> {
 
 /** userKey (optional) lets a visitor supply their own Z.ai key per-request. */
 export async function chat(messages: Msg[], userKey?: string): Promise<string> {
-  if (userKey) return callWithEnvKey(messages, true, userKey)
-  if (process.env.ZAI_API_KEY) return callWithEnvKey(messages, true)
+  if (userKey) return withTransientRetry(() => callWithEnvKey(messages, true, userKey))
+  if (process.env.ZAI_API_KEY) return withTransientRetry(() => callWithEnvKey(messages, true))
   try {
     return await callSdk(messages)
   } catch (e) {
