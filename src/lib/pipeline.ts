@@ -322,15 +322,30 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
   // (containing split sub-chunks); otherwise derive it from the original chunks.
   const work: PipelineChunk[] =
     cp.queue && cp.queue.length > 0 ? cp.queue : chunks.slice(Math.min(cp.doneCount, total))
-  let pos = 0
+
+  // Parallel lanes check items out of `pending`; each lane keeps its own
+  // in-flight / split sub-parts in laneLeftovers. Together they ARE the
+  // remaining work — checkpoints are rebuilt from them after every part.
+  const pending: PipelineChunk[] = work.slice()
+  const laneLeftovers: PipelineChunk[][] = []
+  const pendingItems = (): PipelineChunk[] => {
+    const rest: PipelineChunk[] = []
+    for (const l of laneLeftovers) {
+      for (const c of l) rest.push(c)
+    }
+    for (const c of pending) rest.push(c)
+    return rest
+  }
 
   const remainingChars = (): number => {
     let s = 0
-    for (let k = pos; k < work.length; k++) s += work[k].text.length
+    for (const c of pendingItems()) s += c.text.length
     return s
   }
-  const partsDone = (): number => total - new Set(work.slice(pos).map((c) => c.i)).size
+  const partsDone = (): number => total - new Set(pendingItems().map((c) => c.i)).size
   const charRates: number[] = [] // chars/sec per finished item — honest ETA across granularities
+  let laneTarget = 1 // refined by preflight from the server's key-pool size
+  let fatal: unknown = null
 
   const emit = (p: Partial<PipelineProgress> & { stage: PipelineProgress['stage']; label: string }) => {
     const cardsSoFar = cp.cards.length
@@ -393,7 +408,7 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
     let item = queue[at]
     let softRetries = 0
     for (;;) {
-      if (handle.aborted) return { cards: [], item }
+      if (handle.aborted || fatal) return { cards: [], item }
       try {
         const data = await postJSON<{ meta?: DeckMeta; cards?: GeneratedCard[] }>('/api/generate', {
           source: item.text,
@@ -406,7 +421,7 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
         return { cards: data.cards ?? [], meta: data.meta, item }
       } catch (e) {
         const err = e as Error & { retryAfter?: number; busy?: boolean; status?: number }
-        if (handle.aborted) return { cards: [], item }
+        if (handle.aborted || fatal) return { cards: [], item }
         // Defense in depth: gateway timeouts (504) and Retry-After-less 429s
         // arrive without the busy flag — recognize them by shape and pause
         // instead of aborting the whole run.
@@ -451,7 +466,7 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
     if (!opts.verify || cards.length === 0) return cards
     const waits = [0, 8, 15]
     for (const w of waits) {
-      if (handle.aborted) return cards
+      if (handle.aborted || fatal) return cards
       if (w > 0) {
         emit({ stage: 'verify', label: `Free tier busy — retrying precision check in ${w}s…`, retryInSec: w })
         await sleep(w * 1000)
@@ -474,7 +489,20 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
     return cards
   }
 
-  emit({ stage: 'extract', label: 'Preparing sections…', pct: 3 })
+  // Honest expectation-setting before the first model call: rough call count
+  // and wall-clock range, adjusted for precision/deep and available lanes.
+  const estCalls =
+    (opts.deep && total >= 2 ? 1 : 0) +
+    total * (opts.verify ? 2 : 1) +
+    (opts.deep && total >= 2 ? Math.min(2, Math.ceil((total - 1) / 4)) : 0)
+  const laneDiv = Math.max(1, laneTarget)
+  const estLo = Math.max(1, Math.round((estCalls * 0.12) / laneDiv))
+  const estHi = Math.max(estLo + 1, Math.round((estCalls * 0.5) / laneDiv))
+  emit({
+    stage: 'extract',
+    label: `Preparing sections… ${total} part${total > 1 ? 's' : ''} · ~${estCalls} model calls · expect ~${estLo}–${estHi} min on the free tier`,
+    pct: 3,
+  })
 
   // Pre-flight capacity probe — start smart instead of firing the first request
   // into a saturated pool. /api/status reads the governor's memory (no model
@@ -488,10 +516,13 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
         if (!res.ok) return
         const s = (await res.json()) as {
           queuePending?: number
-          governor?: { windowMax: number; windowUsed: number; breakerRemainingSec: number }
+          governor?: { windowMax: number; windowUsed: number; breakerRemainingSec: number; concurrency?: number }
         }
         const g = s.governor
         if (!g) return
+        if (typeof g.concurrency === 'number' && g.concurrency >= 1) {
+          laneTarget = Math.max(1, Math.min(4, Math.round(g.concurrency)))
+        }
         if (g.breakerRemainingSec > 0) {
           const w = Math.min(g.breakerRemainingSec + 2, 60)
           emit({ stage: 'extract', label: `Model capacity cooling down — starting in ~${w}s…`, retryInSec: w, pct: 3 })
@@ -540,47 +571,77 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
     }
   }
 
-  // ---- generation loop (every part, however small, is a checkpoint) ----
-  while (pos < work.length) {
-    if (handle.aborted) break
-    const planned = work[pos]
-    const partNo = Math.min(partsDone() + 1, total)
-    emit({ stage: 'generate', label: `Part ${partNo}/${total} — ${planned.heading} · generating…` })
-    const t0 = Date.now()
+  // ---- parallel lanes: each lane checks out parts; a busy part is split
+  // inside its own lane, so lanes never touch each other's queue indexes.
+  // With one pooled key this behaves exactly like the old serial loop.
+  const lanes = Math.max(1, Math.min(4, laneTarget))
 
-    const { cards: genCards, meta, item } = await callGenerate(work, pos)
-    if (handle.aborted) break
-    if (meta && !cp.firstMeta) {
-      cp.firstMeta = meta
-      if (cp.mapResult && cp.mapResult.sections.length > 0) {
-        cp.firstMeta.deckTitle = `${cp.firstMeta.deckTitle}`.slice(0, 120)
+  const runLane = async (laneIdx: number): Promise<void> => {
+    const local: PipelineChunk[] = []
+    laneLeftovers[laneIdx] = local
+    for (;;) {
+      if (handle.aborted || fatal) return
+      if (local.length === 0) {
+        const head = pending.shift()
+        if (!head) return
+        local.push(head)
       }
+      const planned = local[0]
+      const partNo = Math.min(partsDone() + 1, total)
+      emit({ stage: 'generate', label: `Part ${partNo}/${total} — ${planned.heading} · generating…` })
+      const t0 = Date.now()
+
+      const { cards: genCards, meta, item } = await callGenerate(local, 0)
+      if (handle.aborted || fatal) return
+      if (meta && !cp.firstMeta) {
+        cp.firstMeta = meta
+        if (cp.mapResult && cp.mapResult.sections.length > 0) {
+          cp.firstMeta.deckTitle = `${cp.firstMeta.deckTitle}`.slice(0, 120)
+        }
+      }
+
+      let chunkCards: GeneratedCard[] = genCards.map((c) => ({ ...c, section: sectionFor(item.i) }))
+
+      if (opts.verify && chunkCards.length > 0) {
+        emit({ stage: 'verify', label: `${item.heading} — precision check…` })
+        chunkCards = await callVerify(item, chunkCards)
+        if (handle.aborted || fatal) return
+      }
+
+      cp.cards.push(...chunkCards)
+      for (const c of chunkCards) {
+        const topic = c.question.split(/\s+/).slice(0, 9).join(' ')
+        if (topic && !cp.coveredTopics.includes(topic)) cp.coveredTopics.push(topic)
+      }
+
+      charRates.push(Math.max(30, item.text.length / Math.max(1, (Date.now() - t0) / 1000)))
+      const done = local.indexOf(item)
+      if (done >= 0) local.splice(done, 1)
+      cp.doneCount = Math.max(0, partsDone())
+      cp.queue = pendingItems()
+      saveCheckpoint(cp)
+      emit({
+        stage: 'generate',
+        label: `Part ${Math.min(partsDone(), total)}/${total} done — ${cp.cards.length} cards so far`,
+        preview: cp.cards.slice(-5).map((c) => ({ question: c.question, answer: c.answer })),
+      })
     }
-
-    let chunkCards: GeneratedCard[] = genCards.map((c) => ({ ...c, section: sectionFor(item.i) }))
-
-    if (opts.verify && chunkCards.length > 0) {
-      emit({ stage: 'verify', label: `Part ${partNo}/${total} — precision check…` })
-      chunkCards = await callVerify(item, chunkCards)
-    }
-
-    cp.cards.push(...chunkCards)
-    for (const c of chunkCards) {
-      const topic = c.question.split(/\s+/).slice(0, 9).join(' ')
-      if (topic && !cp.coveredTopics.includes(topic)) cp.coveredTopics.push(topic)
-    }
-
-    pos++
-    charRates.push(Math.max(30, item.text.length / Math.max(1, (Date.now() - t0) / 1000)))
-    cp.doneCount = Math.max(0, partsDone())
-    cp.queue = work.slice(pos)
-    saveCheckpoint(cp)
-    emit({
-      stage: 'generate',
-      label: `Part ${Math.min(partsDone(), total)}/${total} done — ${cp.cards.length} cards so far`,
-      preview: cp.cards.slice(-5).map((c) => ({ question: c.question, answer: c.answer })),
-    })
   }
+
+  await Promise.all(
+    Array.from({ length: lanes }, (_, k) =>
+      runLane(k).catch((e) => {
+        if (!fatal) fatal = e
+      }),
+    ),
+  )
+
+  // Final accounting: persist exactly what is left (in-flight parts included)
+  // whether we finished, were stopped, or hit a fatal error — all resumable.
+  cp.doneCount = Math.max(0, partsDone())
+  cp.queue = pendingItems()
+  saveCheckpoint(cp)
+  if (fatal) throw fatal
 
   if (handle.aborted) {
     saveCheckpoint(cp)

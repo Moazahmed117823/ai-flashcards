@@ -29,6 +29,7 @@ export async function POST(req: NextRequest) {
   const inputCards = (body.cards ?? [])
     .map((c) => ({ question: String(c?.question ?? '').trim(), answer: String(c?.answer ?? '').trim() }))
     .filter((c) => c.question && c.answer)
+  const userKey = req.headers.get('x-user-key')?.trim() || undefined
 
   if (source.length < 40) {
     return NextResponse.json({ error: 'Source text is too short to verify against.' }, { status: 400 })
@@ -43,7 +44,7 @@ export async function POST(req: NextRequest) {
   try {
     const verified = await enqueue(async (): Promise<VerifiedCard[]> => {
       const messages = buildVerifyMessages(source, inputCards)
-      const raw = await chat(messages)
+      const raw = await chat(messages, userKey)
       const parsed = extractJson(raw)
       const arr = Array.isArray(parsed.cards) ? (parsed.cards as Array<Record<string, unknown>>) : []
       return arr.map((c) => {

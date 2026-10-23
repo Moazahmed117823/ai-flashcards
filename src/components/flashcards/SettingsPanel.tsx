@@ -29,6 +29,9 @@ interface Props {
 export function SettingsPanel({ decks, onChanged }: Props) {
   const [estimate, setEstimate] = useState<{ usage: number; quota: number } | null>(null)
   const [userKey, setUserKey] = useState('')
+  const [keyTest, setKeyTest] = useState<{ state: 'idle' | 'testing' | 'ok' | 'fail' | 'busy'; msg?: string }>({
+    state: 'idle',
+  })
   const totalCards = decks.reduce((n, d) => n + d.cards.length, 0)
 
   useEffect(() => {
@@ -71,9 +74,28 @@ export function SettingsPanel({ decks, onChanged }: Props) {
     try {
       if (userKey.trim()) localStorage.setItem('zai_user_key', userKey.trim())
       else localStorage.removeItem('zai_user_key')
+      setKeyTest({ state: 'idle' })
       toast.success(userKey.trim() ? 'Personal key saved in this browser.' : 'Personal key removed.')
     } catch {
       toast.error('Could not access browser storage.')
+    }
+  }
+
+  async function testKey() {
+    const key = userKey.trim()
+    if (!key) return
+    setKeyTest({ state: 'testing' })
+    try {
+      const res = await fetch('/api/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string }
+      if (res.ok && data.ok) setKeyTest({ state: 'ok' })
+      else setKeyTest({ state: res.status === 429 ? 'busy' : 'fail', msg: data.error })
+    } catch {
+      setKeyTest({ state: 'fail', msg: 'Network error — try again.' })
     }
   }
 
@@ -172,15 +194,29 @@ export function SettingsPanel({ decks, onChanged }: Props) {
             your generation requests.
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex gap-2">
-          <Input
-            type="password"
-            value={userKey}
-            onChange={(e) => setUserKey(e.target.value)}
-            placeholder="Z.ai API key (optional)"
-            autoComplete="off"
-          />
-          <Button onClick={saveKey}>Save</Button>
+        <CardContent className="space-y-2">
+          <div className="flex gap-2">
+            <Input
+              type="password"
+              value={userKey}
+              onChange={(e) => setUserKey(e.target.value)}
+              placeholder="Z.ai API key (optional)"
+              autoComplete="off"
+            />
+            <Button
+              variant="outline"
+              onClick={() => void testKey()}
+              disabled={!userKey.trim() || keyTest.state === 'testing'}
+            >
+              {keyTest.state === 'testing' ? 'Testing…' : 'Test'}
+            </Button>
+            <Button onClick={saveKey}>Save</Button>
+          </div>
+          {keyTest.state === 'ok' && (
+            <p className="text-xs text-emerald-600">Key works — your generations will use it automatically.</p>
+          )}
+          {keyTest.state === 'busy' && <p className="text-xs text-amber-600">{keyTest.msg}</p>}
+          {keyTest.state === 'fail' && <p className="text-xs text-destructive">{keyTest.msg}</p>}
         </CardContent>
       </Card>
 

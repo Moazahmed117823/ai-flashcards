@@ -16,13 +16,29 @@ export class UpstreamError extends Error {
 }
 
 /**
- * Free-tier friendly serial queue (GLM Flash models allow ~1 concurrent
- * request). All generation work funnels through here; anything past the
- * cap gets a 429 so the client can retry.
+ * Free-tier friendly request limiter: up to `concurrencyLimit()` concurrent
+ * upstream calls per instance (one per pooled key), excess waits FIFO and
+ * gets QueueFullError (429) when the queue is full or the wait would risk a
+ * 504. All generation work funnels through here.
  */
-let chain: Promise<unknown> = Promise.resolve()
 let pending = 0
-const MAX_QUEUE = 12
+let active = 0
+const MAX_QUEUE = 12 * Math.max(1, governor.upstreamKeys().length)
+const MAX_FIFO_WAIT_MS = 25_000
+const waiters: Array<{ at: number; start: () => void; fail: (e: Error) => void }> = []
+
+function pump(): void {
+  const limit = governor.concurrencyLimit()
+  while (active < limit && waiters.length > 0) {
+    const w = waiters.shift()!
+    if (Date.now() - w.at > MAX_FIFO_WAIT_MS) {
+      w.fail(new QueueFullError())
+      continue
+    }
+    active++
+    w.start()
+  }
+}
 
 export const queueSnapshot = (): number => pending
 
@@ -31,11 +47,26 @@ export function enqueue<T>(fn: () => Promise<T>): Promise<T> {
     return Promise.reject(new QueueFullError()) as Promise<T>
   }
   pending++
-  const run = chain.then(fn, fn)
-  chain = run.catch(() => undefined)
-  return run.finally(() => {
-    pending--
-  }) as Promise<T>
+  return new Promise<T>((resolve, reject) => {
+    const entry = {
+      at: Date.now(),
+      fail: (e: Error) => {
+        pending--
+        reject(e)
+      },
+      start: () => {
+        fn()
+          .then(resolve, reject)
+          .finally(() => {
+            active--
+            pending--
+            pump()
+          })
+      },
+    }
+    waiters.push(entry)
+    pump()
+  })
 }
 
 export class QueueFullError extends Error {
@@ -118,6 +149,9 @@ async function callWithEnvKey(messages: Msg[], jsonMode: boolean, keyOverride?: 
 
   if (!res.ok) {
     const text = await res.text()
+    // This key's account just got rejected — cool it down so the next attempt
+    // (or the next request) picks a different key from the pool.
+    governor.penalizeKey(keyOverride, res.status === 429 || res.status >= 500 ? 20 : 5)
     if (res.status === 400 && jsonMode) return callWithEnvKey(messages, false) // endpoint may not support response_format
     let msg = `Model API error ${res.status}`
     try {
@@ -157,15 +191,19 @@ async function callSdk(messages: Msg[]): Promise<string> {
 export async function chat(messages: Msg[], userKey?: string): Promise<string> {
   const entered = Date.now()
   await governor.acquire() // deterministic pacing — throws BusyError when the budget/breaker says wait
-  // The queue wait counts against this function's 60s Vercel cap. If it ate
-  // most of the window, refuse politely (busy) instead of risking a 504.
-  const budgetMs = 54_000 - (Date.now() - entered)
-  if (budgetMs < 15_000) {
-    throw new governor.BusyError(12, 'Queue wait used this request window — starting fresh in a few seconds.')
-  }
   try {
+    // The queue wait counts against this function's 60s Vercel cap. If it ate
+    // most of the window, refuse politely (busy) instead of risking a 504.
+    const budgetMs = 54_000 - (Date.now() - entered)
+    if (budgetMs < 15_000) {
+      throw new governor.BusyError(12, 'Queue wait used this request window — starting fresh in a few seconds.')
+    }
     if (userKey) return await withTransientRetry(() => callWithEnvKey(messages, true, userKey), budgetMs)
-    if (process.env.ZAI_API_KEY) return await withTransientRetry(() => callWithEnvKey(messages, true), budgetMs)
+    if (process.env.ZAI_API_KEY) {
+      // Each attempt picks the healthiest pooled key — a key that just got a
+      // 429 is skipped in favor of the next one, inside the same request.
+      return await withTransientRetry(() => callWithEnvKey(messages, true, governor.pickKey()), budgetMs)
+    }
     try {
       return await callSdk(messages)
     } catch (e) {
@@ -174,9 +212,8 @@ export async function chat(messages: Msg[], userKey?: string): Promise<string> {
         `No model backend available. Add a ZAI_API_KEY environment variable (free key from the Z.ai API platform). [${detail}]`,
       )
     }
-  } catch (e) {
-    if (e instanceof governor.BusyError) throw e
-    throw e
+  } finally {
+    governor.release()
   }
 }
 

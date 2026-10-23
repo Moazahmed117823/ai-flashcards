@@ -22,13 +22,14 @@ export async function POST(req: NextRequest) {
 
   const chunks = (body.chunks ?? []).filter((c) => Number.isInteger(c.i) && typeof c.title === 'string')
   const total = Math.min(Math.max(Number(body.total) || 12, 3), 200)
+  const userKey = req.headers.get('x-user-key')?.trim() || undefined
   if (chunks.length < 2 || chunks.length > 60) {
     return NextResponse.json({ error: 'Map expects between 2 and 60 chunks.' }, { status: 400 })
   }
 
   try {
     const map = await enqueue(async (): Promise<MapResult> => {
-      const raw = await chat(buildMapMessages(chunks, total))
+      const raw = await chat(buildMapMessages(chunks, total), userKey)
       const parsed = extractJson(raw)
       const rawSections = Array.isArray(parsed.sections) ? (parsed.sections as Array<Record<string, unknown>>) : []
       const rawBudget = Array.isArray(parsed.budget) ? (parsed.budget as Array<Record<string, unknown>>) : []

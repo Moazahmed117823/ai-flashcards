@@ -22,13 +22,14 @@ export async function POST(req: NextRequest) {
   const boundaries = (body.boundaries ?? [])
     .filter((b) => b && typeof b.aTail === 'string' && typeof b.bHead === 'string')
     .slice(0, 4)
+  const userKey = req.headers.get('x-user-key')?.trim() || undefined
   if (boundaries.length === 0) {
     return NextResponse.json({ error: 'No boundaries provided.' }, { status: 400 })
   }
 
   try {
     const cards = await enqueue(async (): Promise<GeneratedCard[]> => {
-      const raw = await chat(buildLinkMessages(boundaries))
+      const raw = await chat(buildLinkMessages(boundaries), userKey)
       const parsed = extractJson(raw)
       const arr = Array.isArray(parsed.cards) ? (parsed.cards as Array<Record<string, unknown>>) : []
       return arr
