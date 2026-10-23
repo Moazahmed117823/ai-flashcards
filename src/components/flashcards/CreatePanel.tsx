@@ -296,7 +296,7 @@ export function CreatePanel({ onDraft }: Props) {
           </div>
 
           <div className="flex items-start gap-3 sm:col-span-2">
-            <Switch id="verify" checked={verify} onValueChange={setVerify} />
+            <Switch id="verify" checked={verify} onCheckedChange={setVerify} />
             <div>
               <Label htmlFor="verify" className="flex items-center gap-1.5">
                 <ShieldCheck className="h-4 w-4 text-emerald-600" /> Precision mode (recommended for medical content)
