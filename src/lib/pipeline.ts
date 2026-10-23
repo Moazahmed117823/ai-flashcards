@@ -350,7 +350,8 @@ export async function runPipeline(args: RunArgs): Promise<RunResult> {
       cardsSoFar,
       etaSec,
       retryInSec: p.retryInSec,
-      preview: p.preview,
+      // keep the latest cards visible through every stage (no flicker between parts)
+      preview: p.preview ?? (cardsSoFar > 0 ? cp.cards.slice(-5).map((c) => ({ question: c.question, answer: c.answer })) : undefined),
     })
   }
 
